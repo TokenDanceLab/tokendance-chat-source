@@ -1,0 +1,18 @@
+# TokenDanceChat
+
+TokenDanceChat is TokenDance's real-time public chat product. It runs a lightweight WebSocket chat room, TokenBot assistant, PWA surface, and TokenDance Account OIDC login.
+
+Canonical site: https://chat.tokendancelab.com
+Identity provider: https://account.tokendancelab.com
+Source: each public deployment must publish its exact Corresponding Source; the development repository is not an access-controlled substitute.
+License: AGPL-3.0-only (prior MIT releases and third-party licenses remain intact)
+
+## Agent Notes
+
+- TokenDanceChat is a TokenDance Account OIDC relying party. Do not add direct GitHub, Google, or Feishu social login to this product; Account owns upstream identity linking.
+- Authentication is a confidential OIDC BFF. The backend exchanges the authorization code, reads UserInfo, keys local users by the Account `sub`, and gives the browser only an HttpOnly Chat session cookie.
+- AgentHub integration is optional and is not a current product dependency or roadmap priority.
+- Public docs live in the repository README and docs folder until a dedicated marketing/docs site exists.
+- Public discovery files are https://chat.tokendancelab.com/robots.txt, https://chat.tokendancelab.com/sitemap.xml, and https://chat.tokendancelab.com/llms.txt.
+- Keep PWA, offline, auth, error, and assistant surfaces aligned across Chinese and English copy.
+- Keep Chat and Account boundaries authoritative; document an AgentHub mapping only when an integration is explicitly scheduled.
