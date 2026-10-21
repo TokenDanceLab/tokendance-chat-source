@@ -1,0 +1,1370 @@
+package handler
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"tokendancechat/backend/hub"
+	"tokendancechat/backend/security"
+	"tokendancechat/backend/store"
+
+	"github.com/google/uuid"
+)
+
+// Handler holds dependencies for HTTP handlers.
+type Handler struct {
+	hub              *hub.Hub
+	store            hub.Store
+	mu               sync.RWMutex
+	uploadsDir       string
+	mediaStore       MediaStore
+	linkPreviewCache map[string]linkPreviewResult
+	sessionSecret    []byte
+
+	// OIDC configuration.
+	oidcEnabled       bool
+	oidcClientID      string
+	oidcClientSecret  string // confidential-client secret; empty = PKCE public client
+	oidcIssuer        string
+	oidcRedirectURI   string
+	oidcPostLogoutURI string
+	oidcConfig        *OIDCConfig
+	oidcStates        *OIDCStateStore
+	oidcJWKS          *oidcJWKSCache
+	cookieSecure      bool
+
+	// turnstile verifies Cloudflare Turnstile tokens on credential endpoints.
+	turnstile *security.Turnstile
+}
+
+// linkPreviewResult stores cached OpenGraph data for a URL.
+type linkPreviewResult struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Image       string `json:"image"`
+	SiteName    string `json:"site_name"`
+	URL         string `json:"url"`
+	fetchedAt   time.Time
+}
+
+// contextKey is a private type to avoid collisions in context.WithValue.
+type contextKey string
+
+const requestIDKey contextKey = "request_id"
+
+const (
+	sessionCookieName = "tdchat_session"
+	sessionTokenTTL   = 7 * 24 * time.Hour
+)
+
+const (
+	defaultMessageLimit       = 100
+	maxMessageLimit           = 500
+	publicPreviewMessageLimit = 20
+)
+
+const (
+	maxWebhookBodySize      = 8 << 10 // 8 KiB
+	maxWebhookContentLength = 2000
+)
+
+type sessionTokenPayload struct {
+	Username   string `json:"username"`
+	Kind       string `json:"kind"`
+	Subject    string `json:"sub,omitempty"`
+	Generation int64  `json:"generation,omitempty"`
+	Exp        int64  `json:"exp"`
+	Nonce      string `json:"nonce"`
+}
+
+type oidcLogoutStore interface {
+	OIDCLogoutGeneration(sub string) (int64, error)
+}
+
+type oidcBackchannelStore interface {
+	oidcLogoutStore
+	ApplyOIDCBackchannelLogout(
+		sub, jti, claimsSHA256 string,
+		receivedAt, expiresAt time.Time,
+	) (store.OIDCBackchannelLogoutResult, error)
+}
+
+// New creates a new Handler.
+func New(h *hub.Hub, s hub.Store, uploadsDir string) *Handler {
+	handler := &Handler{
+		hub:              h,
+		store:            s,
+		uploadsDir:       uploadsDir,
+		mediaStore:       NewLocalMediaStore(uploadsDir),
+		linkPreviewCache: make(map[string]linkPreviewResult),
+		sessionSecret:    loadSessionSecret(),
+		turnstile:        loadTurnstileVerifier(),
+		cookieSecure:     loadCookieSecure(),
+	}
+	// Periodic cleanup of expired link preview cache entries.
+	go handler.pruneLinkPreviewCache()
+	return handler
+}
+
+func loadCookieSecure() bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv("CHAT_COOKIE_SECURE")))
+	switch value {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func loadSessionSecret() []byte {
+	if secret := os.Getenv("CHAT_SESSION_SECRET"); secret != "" {
+		sum := sha256.Sum256([]byte(secret))
+		return sum[:]
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err == nil {
+		return secret
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+	return sum[:]
+}
+
+func (h *Handler) issueSessionToken(username, kind string) (string, error) {
+	return h.issueSessionTokenFor(username, kind, "", 0)
+}
+
+func (h *Handler) issueSessionTokenFor(username, kind, subject string, generation int64) (string, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return "", errors.New("username is required")
+	}
+	if kind != "local" && kind != "oidc" {
+		return "", errors.New("invalid session kind")
+	}
+	if kind == "oidc" && strings.TrimSpace(subject) == "" {
+		return "", errors.New("OIDC subject is required")
+	}
+	if generation < 0 {
+		return "", errors.New("session generation is invalid")
+	}
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return "", err
+	}
+	payload := sessionTokenPayload{
+		Username:   username,
+		Kind:       kind,
+		Subject:    subject,
+		Generation: generation,
+		Exp:        time.Now().Add(sessionTokenTTL).Unix(),
+		Nonce:      base64.RawURLEncoding.EncodeToString(nonceBytes),
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	payloadPart := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	mac := hmac.New(sha256.New, h.sessionSecret)
+	mac.Write([]byte(payloadPart))
+	sigPart := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return payloadPart + "." + sigPart, nil
+}
+
+func (h *Handler) verifySessionToken(token string) (*sessionTokenPayload, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return nil, false
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, false
+	}
+	mac := hmac.New(sha256.New, h.sessionSecret)
+	mac.Write([]byte(parts[0]))
+	expected := mac.Sum(nil)
+	if subtle.ConstantTimeCompare(signature, expected) != 1 {
+		return nil, false
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, false
+	}
+	var payload sessionTokenPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return nil, false
+	}
+	if payload.Username == "" || payload.Nonce == "" || payload.Exp <= time.Now().Unix() ||
+		(payload.Kind != "local" && payload.Kind != "oidc") {
+		return nil, false
+	}
+	if payload.Kind == "oidc" && payload.Subject == "" {
+		return nil, false
+	}
+	return &payload, true
+}
+
+func (h *Handler) sessionFromRequest(r *http.Request) (*sessionTokenPayload, bool) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return nil, false
+	}
+	session, ok := h.verifySessionToken(cookie.Value)
+	if !ok {
+		return nil, false
+	}
+	// OIDC mode has one production identity plane. A local Chat cookie minted
+	// before the switch must not remain a second way to enter the product.
+	if h.oidcEnabled && session.Kind != "oidc" {
+		return nil, false
+	}
+	if session.Kind == "oidc" {
+		logoutStore, ok := h.store.(oidcLogoutStore)
+		if !ok {
+			return nil, false
+		}
+		generation, err := logoutStore.OIDCLogoutGeneration(session.Subject)
+		if err != nil || generation != session.Generation {
+			return nil, false
+		}
+	}
+	return session, true
+}
+
+func (h *Handler) setSessionCookie(w http.ResponseWriter, username, kind string) error {
+	token, err := h.issueSessionToken(username, kind)
+	if err != nil {
+		return err
+	}
+	h.writeSessionCookie(w, token)
+	return nil
+}
+
+func (h *Handler) setOIDCSessionCookie(w http.ResponseWriter, username, subject string) error {
+	logoutStore, ok := h.store.(oidcLogoutStore)
+	if !ok {
+		return errors.New("OIDC logout generation store is unavailable")
+	}
+	generation, err := logoutStore.OIDCLogoutGeneration(subject)
+	if err != nil {
+		return err
+	}
+	token, err := h.issueSessionTokenFor(username, "oidc", subject, generation)
+	if err != nil {
+		return err
+	}
+	h.writeSessionCookie(w, token)
+	return nil
+}
+
+func (h *Handler) writeSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionTokenTTL.Seconds()),
+	})
+}
+
+func (h *Handler) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
+func (h *Handler) sessionCSRFToken(session *sessionTokenPayload) string {
+	mac := hmac.New(sha256.New, h.sessionSecret)
+	mac.Write([]byte("tdchat-csrf-v1\x00"))
+	mac.Write([]byte(session.Username))
+	mac.Write([]byte{0})
+	mac.Write([]byte(session.Kind))
+	mac.Write([]byte{0})
+	mac.Write([]byte(session.Subject))
+	mac.Write([]byte{0})
+	mac.Write([]byte(session.Nonce))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (h *Handler) validSessionCSRF(r *http.Request, session *sessionTokenPayload) bool {
+	provided := r.Header.Get("X-CSRF-Token")
+	expected := h.sessionCSRFToken(session)
+	return provided != "" &&
+		subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	rawOrigin := strings.TrimSpace(r.Header.Get("Origin"))
+	if rawOrigin == "" {
+		return true
+	}
+	origin, _, ok := normalizeOrigin(rawOrigin)
+	if !ok || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return false
+	}
+	return strings.EqualFold(origin.Scheme, requestScheme(r)) &&
+		strings.EqualFold(origin.Host, r.Host)
+}
+
+func (h *Handler) requireSession(w http.ResponseWriter, r *http.Request) (string, bool) {
+	requestID := requestIDFromContext(r.Context())
+	session, ok := h.sessionFromRequest(r)
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "authentication required", "AUTH_REQUIRED", requestID)
+		return "", false
+	}
+	return session.Username, true
+}
+
+func (h *Handler) optionalSession(w http.ResponseWriter, r *http.Request) (string, bool, bool) {
+	session, ok := h.sessionFromRequest(r)
+	if !ok {
+		return "", false, true
+	}
+	return session.Username, true, true
+}
+
+// The local credential plane exists for OIDC-disabled development. Once Account
+// OIDC is enabled, these routes must disappear from the product boundary even
+// if another client guesses their paths.
+func (h *Handler) localCredentialsDisabled(w http.ResponseWriter, r *http.Request) bool {
+	if !h.oidcEnabled {
+		return false
+	}
+	writeJSONError(w, http.StatusNotFound, "not found", "NOT_FOUND", requestIDFromContext(r.Context()))
+	return true
+}
+
+func (h *Handler) pruneLinkPreviewCache() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		h.mu.Lock()
+		now := time.Now()
+		for k, v := range h.linkPreviewCache {
+			if now.Sub(v.fetchedAt) > 1*time.Hour {
+				delete(h.linkPreviewCache, k)
+			}
+		}
+		h.mu.Unlock()
+	}
+}
+
+// writeJSONError writes a consistent JSON error response.
+func writeJSONError(w http.ResponseWriter, status int, msg, code, requestID string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"error":      msg,
+		"code":       code,
+		"request_id": requestID,
+	})
+}
+
+// CORSMiddleware restricts cross-origin requests to explicitly allowed origins.
+// CHAT_ALLOWED_ORIGINS accepts comma-separated origins such as
+// "https://chat.example.com" or "https://*.example.com". Wildcard "*" is not
+// accepted once bearer sessions are present.
+func CORSMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin, ok := allowedOrigin(r); ok {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			if origin != "" {
+				w.Header().Set("Vary", "Origin")
+			}
+		}
+
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// SecurityHeadersMiddleware adds security-related HTTP headers to every response.
+func SecurityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("X-XSS-Protection", "0")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		// CSP: 'self' covers same-origin ws/wss; https: for user uploads and
+		// previews; challenges.cloudflare.com for the Turnstile widget.
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://challenges.cloudflare.com ws: wss:; img-src 'self' data: https:; font-src 'self'; base-uri 'self'; form-action 'self'; frame-src https://challenges.cloudflare.com")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// HealthCheck handles GET /api/health.
+func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+	dbStatus := "ok"
+	if err := h.store.Ping(); err != nil {
+		dbStatus = "error"
+		log.Printf("health check: db ping failed: %v", err)
+	}
+	statusCode := http.StatusOK
+	if dbStatus != "ok" {
+		statusCode = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  dbStatus,
+		"service": "tokendancechat",
+		"db":      dbStatus,
+	})
+}
+
+// GetMessages handles GET /api/messages?limit=100&before=timestamp.
+func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+
+	username, authenticated, ok := h.optionalSession(w, r)
+	if !ok {
+		return
+	}
+	if !authenticated && r.URL.Query().Get("before") != "" {
+		writeJSONError(w, http.StatusUnauthorized, "authentication required", "AUTH_REQUIRED", requestID)
+		return
+	}
+
+	limit := defaultMessageLimit
+	maxLimit := maxMessageLimit
+	if !authenticated {
+		limit = publicPreviewMessageLimit
+		maxLimit = publicPreviewMessageLimit
+	}
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			if parsed > maxLimit {
+				limit = maxLimit
+			} else {
+				limit = parsed
+			}
+		}
+	}
+
+	var before int64
+	if b := r.URL.Query().Get("before"); b != "" {
+		if parsed, err := strconv.ParseInt(b, 10, 64); err == nil {
+			before = parsed
+		}
+	}
+
+	// Private thread: ?to=<username> returns the 1:1 conversation between the
+	// authenticated user and <username> (e.g. the private TokenBot chat). This
+	// only works for authenticated requests.
+	if to := r.URL.Query().Get("to"); to != "" {
+		if !authenticated {
+			writeJSONError(w, http.StatusUnauthorized, "authentication required", "AUTH_REQUIRED", requestID)
+			return
+		}
+		messages := h.store.GetMessagesBetween(username, to, limit)
+		if messages == nil {
+			messages = []hub.StoredMessage{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"messages": messages,
+		})
+		return
+	}
+
+	messages := h.store.GetMessages(limit, before)
+	if messages == nil {
+		messages = []hub.StoredMessage{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"messages": messages,
+	})
+}
+
+// GetOnlineUsers handles GET /api/users/online.
+func (h *Handler) GetOnlineUsers(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+
+	users := h.hub.OnlineUsers()
+	if users == nil {
+		users = []string{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"online": users,
+		"count":  len(users),
+	})
+}
+
+// Stats handles GET /api/stats.
+func (h *Handler) Stats(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+
+	connections := h.hub.ConnectionCount()
+	messagesTotal := h.store.TotalMessages()
+	uptime := h.hub.Uptime()
+	droppedMessages := h.hub.DroppedMessages()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"connections":      connections,
+		"messages_total":   messagesTotal,
+		"uptime_seconds":   int64(uptime.Seconds()),
+		"dropped_messages": droppedMessages,
+		"started_at":       h.hub.StartTime.UTC().Format("2006-01-02T15:04:05Z"),
+	})
+}
+
+// Search handles GET /api/search?q=...&room=...&limit=...
+func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+	if _, ok := h.requireSession(w, r); !ok {
+		return
+	}
+
+	q := r.URL.Query().Get("q")
+	if q == "" {
+		writeJSONError(w, http.StatusBadRequest, "q parameter is required", "MISSING_QUERY", requestID)
+		return
+	}
+
+	roomID := r.URL.Query().Get("room")
+	limit := 20
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 100 {
+			limit = parsed
+		}
+	}
+
+	results, err := h.store.SearchMessages(q, roomID, limit)
+	if err != nil {
+		log.Printf("search error: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "search failed", "SEARCH_ERROR", requestID)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"results": results,
+		"total":   len(results),
+		"query":   q,
+	})
+}
+
+// requestIDFromContext retrieves the request ID from the context, or returns "".
+func requestIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey).(string)
+	return id
+}
+
+// LoggingMiddleware logs incoming HTTP requests with a generated request ID.
+func LoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := uuid.New().String()[:8]
+		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
+		log.Printf("[%s] %s %s %s", reqID, r.Method, r.URL.Path, r.RemoteAddr)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// --- Link Preview ---
+
+var (
+	ogTitleRegex         = regexp.MustCompile(`<meta[^>]+property="og:title"[^>]+content="([^"]*)"`)
+	ogDescriptionRegex   = regexp.MustCompile(`<meta[^>]+property="og:description"[^>]+content="([^"]*)"`)
+	ogImageRegex         = regexp.MustCompile(`<meta[^>]+property="og:image"[^>]+content="([^"]*)"`)
+	ogSiteNameRegex      = regexp.MustCompile(`<meta[^>]+property="og:site_name"[^>]+content="([^"]*)"`)
+	metaDescriptionRegex = regexp.MustCompile(`<meta[^>]+name="description"[^>]+content="([^"]*)"`)
+	htmlTagRe            = regexp.MustCompile(`<[^>]*>`)
+)
+
+// LinkPreview handles GET /api/link-preview?url=...
+func (h *Handler) LinkPreview(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+
+	rawURL := r.URL.Query().Get("url")
+	if rawURL == "" {
+		writeJSONError(w, http.StatusBadRequest, "url parameter is required", "MISSING_URL", requestID)
+		return
+	}
+
+	// Validate URL: https only to prevent SSRF to internal services.
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.Scheme != "https" {
+		writeJSONError(w, http.StatusBadRequest, "invalid URL (https only)", "INVALID_URL", requestID)
+		return
+	}
+
+	// Block private/internal IP ranges to prevent SSRF.
+	if isPrivateHost(parsedURL.Hostname()) {
+		writeJSONError(w, http.StatusBadRequest, "internal URLs are not allowed", "INVALID_URL", requestID)
+		return
+	}
+
+	// Check cache (entries expire after 1 hour).
+	h.mu.RLock()
+	if cached, ok := h.linkPreviewCache[rawURL]; ok {
+		if time.Since(cached.fetchedAt) < 1*time.Hour {
+			h.mu.RUnlock()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(cached)
+			return
+		}
+	}
+	h.mu.RUnlock()
+
+	// Fetch the URL.
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: guardedLinkPreviewDialContext(
+				resolveLinkPreviewHost,
+				(&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+			),
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if req.URL.Scheme != "https" || isPrivateHost(req.URL.Hostname()) {
+				return errors.New("redirect blocked")
+			}
+			return nil
+		},
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, rawURL, nil)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to create request", "FETCH_ERROR", requestID)
+		return
+	}
+	req.Header.Set("User-Agent", "TokenDanceChat/1.0 LinkPreview")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "failed to fetch URL", "FETCH_ERROR", requestID)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read up to 1MB of the response body.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "failed to read response", "FETCH_ERROR", requestID)
+		return
+	}
+
+	bodyStr := string(body)
+
+	// Parse OG tags.
+	result := linkPreviewResult{
+		URL:       rawURL,
+		fetchedAt: time.Now(),
+	}
+
+	if matches := ogTitleRegex.FindStringSubmatch(bodyStr); len(matches) > 1 {
+		result.Title = htmlTagRe.ReplaceAllString(strings.TrimSpace(matches[1]), "")
+	}
+	if matches := ogDescriptionRegex.FindStringSubmatch(bodyStr); len(matches) > 1 {
+		result.Description = htmlTagRe.ReplaceAllString(strings.TrimSpace(matches[1]), "")
+	}
+	if matches := ogImageRegex.FindStringSubmatch(bodyStr); len(matches) > 1 {
+		result.Image = strings.TrimSpace(matches[1])
+	}
+	if matches := ogSiteNameRegex.FindStringSubmatch(bodyStr); len(matches) > 1 {
+		result.SiteName = htmlTagRe.ReplaceAllString(strings.TrimSpace(matches[1]), "")
+	}
+
+	// Fallbacks if OG tags are missing.
+	if result.Title == "" {
+		titleRegex := regexp.MustCompile(`<title[^>]*>([^<]+)</title>`)
+		if matches := titleRegex.FindStringSubmatch(bodyStr); len(matches) > 1 {
+			result.Title = htmlTagRe.ReplaceAllString(strings.TrimSpace(matches[1]), "")
+		}
+	}
+	if result.Description == "" {
+		if matches := metaDescriptionRegex.FindStringSubmatch(bodyStr); len(matches) > 1 {
+			result.Description = htmlTagRe.ReplaceAllString(strings.TrimSpace(matches[1]), "")
+		}
+	}
+
+	// Cache the result.
+	h.mu.Lock()
+	if len(h.linkPreviewCache) >= maxLinkPreviewCacheSize {
+		for k := range h.linkPreviewCache {
+			delete(h.linkPreviewCache, k)
+			break
+		}
+	}
+	h.linkPreviewCache[rawURL] = result
+	h.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// --- Media Uploads ---
+
+const maxEmojiUploadSize = 128 << 10 // 128 KB
+const maxLinkPreviewCacheSize = 1000
+
+// validEmojiExts are the allowed image extensions for custom emojis.
+var validEmojiExts = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
+}
+
+// UploadEmoji handles POST /api/emoji/upload (multipart form, image only, max 128KB).
+func (h *Handler) UploadEmoji(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+	if _, ok := h.requireSession(w, r); !ok {
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxEmojiUploadSize)
+
+	if err := r.ParseMultipartForm(maxEmojiUploadSize); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "file too large (max 128KB)", "FILE_TOO_LARGE", requestID)
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "missing file field", "MISSING_FILE", requestID)
+		return
+	}
+	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if !validEmojiExts[ext] {
+		writeJSONError(w, http.StatusBadRequest, "unsupported file type (allowed: png, jpg, gif, webp)", "INVALID_FILE_TYPE", requestID)
+		return
+	}
+
+	filename := uuid.New().String() + ext
+	mediaKey := "emojis/" + filename
+	contentType := contentTypeForFilename(filename)
+
+	if err := h.mediaStore.Save(r.Context(), mediaKey, contentType, file); err != nil {
+		log.Printf("emoji upload: failed to save %s: %v", mediaKey, err)
+		writeJSONError(w, http.StatusInternalServerError, "failed to save file", "SERVER_ERROR", requestID)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"url":      "/uploads/emojis/" + filename,
+		"filename": filename,
+	})
+}
+
+// ServeEmoji handles GET /uploads/emojis/{filename}
+func (h *Handler) ServeEmoji(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/uploads/emojis/")
+	filename := filepath.Base(trimmed)
+	if filename == "." || filename == "/" || filename == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	mediaKey := "emojis/" + filename
+	media, err := h.mediaStore.Open(r.Context(), mediaKey)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer media.Body.Close()
+
+	if media.ContentType != "" {
+		w.Header().Set("Content-Type", media.ContentType)
+	}
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if _, err := io.Copy(w, media.Body); err != nil {
+		log.Printf("failed to stream emoji %s: %v", filename, err)
+	}
+}
+
+// isPrivateHost checks if a hostname resolves to a private/internal IP address.
+func isPrivateHost(host string) bool {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return true // block unresolvable hosts (safety first)
+	}
+	for _, ip := range ips {
+		if isPrivateIP(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrivateIP(ip net.IP) bool {
+	return ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsPrivate() || ip.IsUnspecified()
+}
+
+func resolveLinkPreviewHost(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+func guardedLinkPreviewDialContext(
+	resolve func(context.Context, string) ([]net.IP, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := resolve(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		if len(ips) == 0 {
+			return nil, errors.New("host resolved to no addresses")
+		}
+		for _, ip := range ips {
+			if isPrivateIP(ip) {
+				return nil, errors.New("resolved IP blocked")
+			}
+		}
+		return dial(ctx, network, net.JoinHostPort(ips[0].String(), port))
+	}
+}
+
+// ExportMessages handles GET /api/export?conversation=...&format=json|text&limit=...
+func (h *Handler) ExportMessages(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+	if _, ok := h.requireSession(w, r); !ok {
+		return
+	}
+
+	conversation := r.URL.Query().Get("conversation")
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "json"
+	}
+	if format != "json" && format != "text" {
+		writeJSONError(w, http.StatusBadRequest, "format must be json or text", "INVALID_FORMAT", requestID)
+		return
+	}
+
+	limit := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			if parsed > 10000 {
+				limit = 10000
+			} else {
+				limit = parsed
+			}
+		}
+	}
+
+	ctx := r.Context()
+
+	var roomID, toUser, groupName, currentUser string
+	var displayName string
+
+	// Parse conversation key.
+	switch {
+	case conversation != "" && conversation != "public":
+		roomID = conversation
+		displayName = conversation
+	default:
+		// Public chat (conversation is empty, "public", or just the room_id).
+		if conversation == "" || conversation == "public" {
+			displayName = "Public Chat"
+		}
+	}
+
+	messages, err := h.store.ExportMessages(ctx, roomID, toUser, groupName, currentUser, limit)
+	if err != nil {
+		log.Printf("export error: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "failed to export messages", "EXPORT_ERROR", requestID)
+		return
+	}
+
+	now := time.Now().Format("2006-01-02")
+	filename := fmt.Sprintf("chat_export_%s_%s.%s",
+		sanitizeExportName(displayName), now, format)
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+
+	switch format {
+	case "text":
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		h.writeTextExport(w, messages, displayName)
+	default:
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(messages)
+	}
+}
+
+// sanitizeExportName replaces characters unsafe for filenames.
+func sanitizeExportName(name string) string {
+	if name == "" {
+		return "public"
+	}
+	re := regexp.MustCompile(`[^a-zA-Z0-9\p{Han}_-]`)
+	safe := re.ReplaceAllString(name, "_")
+	if len(safe) > 100 {
+		safe = safe[:100]
+	}
+	return safe
+}
+
+// writeTextExport writes messages in Telegram-style plain text format.
+func (h *Handler) writeTextExport(w io.Writer, messages []hub.StoredMessage, conversationName string) {
+	now := time.Now().Format("2006-01-02 15:04")
+	fmt.Fprintf(w, "TokenDanceChat Export\r\n")
+	fmt.Fprintf(w, "Conversation: %s\r\n", conversationName)
+	fmt.Fprintf(w, "Exported: %s\r\n", now)
+	fmt.Fprintf(w, "\r\n")
+
+	for _, m := range messages {
+		ts := time.UnixMilli(m.Timestamp).Format("2006-01-02 15:04")
+		content := m.Content
+		if m.Deleted {
+			content = "[deleted]"
+		}
+		if m.Edited {
+			content += " (edited)"
+		}
+		fmt.Fprintf(w, "[%s] %s: %s\r\n", ts, m.Username, content)
+
+		// Append reactions on a new line.
+		if len(m.Reactions) > 0 {
+			var parts []string
+			for emoji, users := range m.Reactions {
+				parts = append(parts, fmt.Sprintf("%s %d", emoji, len(users)))
+			}
+			fmt.Fprintf(w, "    %s\r\n", strings.Join(parts, "  "))
+		}
+	}
+}
+
+// --- User registration and authentication endpoints ---
+
+// Register handles POST /api/register.
+func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if h.localCredentialsDisabled(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+
+	if !AuthAllow(requestIP(r)) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "60")
+		writeJSONError(w, http.StatusTooManyRequests, "too many attempts, try again later", "RATE_LIMITED", requestID)
+		return
+	}
+
+	var body struct {
+		Username       string `json:"username"`
+		Password       string `json:"password"`
+		InviteCode     string `json:"invite_code"`
+		TurnstileToken string `json:"cf_turnstile_response"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON", requestID)
+		return
+	}
+
+	username := strings.TrimSpace(body.Username)
+	password := body.Password
+	inviteCode := strings.TrimSpace(body.InviteCode)
+
+	if err := h.verifyTurnstile(r, body.TurnstileToken); err != nil {
+		log.Printf("register: turnstile rejected: %v", err)
+		if errors.Is(err, security.ErrTurnstileExpired) {
+			writeJSONError(w, http.StatusForbidden, "verification expired, please try again", "TURNSTILE_EXPIRED", requestID)
+			return
+		}
+		if errors.Is(err, security.ErrTurnstileUnavailable) {
+			writeJSONError(w, http.StatusServiceUnavailable, "verification is temporarily unavailable", "VERIFICATION_UNAVAILABLE", requestID)
+			return
+		}
+		writeJSONError(w, http.StatusForbidden, "bot verification failed", "TURNSTILE_FAILED", requestID)
+		return
+	}
+
+	if !hub.ValidateUsername(username) {
+		writeJSONError(w, http.StatusBadRequest, "invalid username: 1-20 chars, letters, digits, underscore, or Chinese", "INVALID_USERNAME", requestID)
+		return
+	}
+
+	if hub.IsReservedUsername(username) || hub.IsAssistantIdentity(username, h.hub.BotName()) {
+		writeJSONError(w, http.StatusBadRequest, "username is reserved", "RESERVED_USERNAME", requestID)
+		return
+	}
+
+	if len(password) < 8 {
+		writeJSONError(w, http.StatusBadRequest, "password must be at least 8 characters", "WEAK_PASSWORD", requestID)
+		return
+	}
+	if len(password) > 72 {
+		writeJSONError(w, http.StatusBadRequest, "password must be at most 72 characters", "PASSWORD_TOO_LONG", requestID)
+		return
+	}
+
+	if inviteCode == "" {
+		writeJSONError(w, http.StatusBadRequest, "invite code is required", "MISSING_INVITE_CODE", requestID)
+		return
+	}
+
+	if err := h.store.RegisterUser(username, password, inviteCode); err != nil {
+		log.Printf("register error: %v", err)
+		if strings.Contains(err.Error(), "invalid invite code") ||
+			strings.Contains(err.Error(), "no remaining uses") ||
+			strings.Contains(err.Error(), "expired") {
+			writeJSONError(w, http.StatusBadRequest, "invalid or expired invite code", "INVALID_INVITE_CODE", requestID)
+			return
+		}
+		if strings.Contains(err.Error(), "already registered") {
+			writeJSONError(w, http.StatusConflict, "username already registered", "USERNAME_TAKEN", requestID)
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "registration failed", "SERVER_ERROR", requestID)
+		return
+	}
+	if err := h.setSessionCookie(w, username, "local"); err != nil {
+		log.Printf("register: session cookie issue failed: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "registration failed", "SERVER_ERROR", requestID)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"username": username,
+	})
+}
+
+// Login handles POST /api/login.
+func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if h.localCredentialsDisabled(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+
+	if !AuthAllow(requestIP(r)) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "60")
+		writeJSONError(w, http.StatusTooManyRequests, "too many attempts, try again later", "RATE_LIMITED", requestID)
+		return
+	}
+
+	var body struct {
+		Username       string `json:"username"`
+		Password       string `json:"password"`
+		TurnstileToken string `json:"cf_turnstile_response"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON", requestID)
+		return
+	}
+
+	username := strings.TrimSpace(body.Username)
+	password := body.Password
+
+	if username == "" || password == "" {
+		writeJSONError(w, http.StatusBadRequest, "username and password are required", "MISSING_FIELDS", requestID)
+		return
+	}
+
+	if err := h.verifyTurnstile(r, body.TurnstileToken); err != nil {
+		log.Printf("login: turnstile rejected: %v", err)
+		if errors.Is(err, security.ErrTurnstileExpired) {
+			writeJSONError(w, http.StatusForbidden, "verification expired, please try again", "TURNSTILE_EXPIRED", requestID)
+			return
+		}
+		if errors.Is(err, security.ErrTurnstileUnavailable) {
+			writeJSONError(w, http.StatusServiceUnavailable, "verification is temporarily unavailable", "VERIFICATION_UNAVAILABLE", requestID)
+			return
+		}
+		writeJSONError(w, http.StatusForbidden, "bot verification failed", "TURNSTILE_FAILED", requestID)
+		return
+	}
+
+	ip := requestIP(r)
+	if wait, ok := authBackoff.Allow(username, ip); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+0.999)))
+		writeJSONError(w, http.StatusTooManyRequests, "too many attempts, try again later", "RATE_LIMITED", requestID)
+		return
+	}
+
+	ok, err := h.store.VerifyUser(username, password)
+	if err != nil {
+		log.Printf("login error: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "login failed", "SERVER_ERROR", requestID)
+		return
+	}
+	if !ok {
+		authBackoff.Fail(username, ip)
+		writeJSONError(w, http.StatusUnauthorized, "invalid username or password", "INVALID_CREDENTIALS", requestID)
+		return
+	}
+	authBackoff.Succeed(username, ip)
+	if err := h.setSessionCookie(w, username, "local"); err != nil {
+		log.Printf("login: session cookie issue failed: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "login failed", "SERVER_ERROR", requestID)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"username": username,
+	})
+}
+
+// SessionHandler returns the authenticated local session, if any.
+// GET /api/session
+func (h *Handler) SessionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestIDFromContext(r.Context()))
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	session, ok := h.sessionFromRequest(r)
+	if !ok {
+		json.NewEncoder(w).Encode(map[string]any{"authenticated": false})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"authenticated": true,
+		"username":      session.Username,
+		"kind":          session.Kind,
+		"csrf_token":    h.sessionCSRFToken(session),
+	})
+}
+
+// Logout clears only the local Chat session and leaves the Account browser
+// session intact. Invalid or expired cookies are cleared without an auth
+// oracle.
+// POST /api/logout
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestIDFromContext(r.Context()))
+		return
+	}
+	if !sameOriginRequest(r) {
+		writeJSONError(w, http.StatusForbidden, "cross-origin logout rejected", "INVALID_ORIGIN", requestIDFromContext(r.Context()))
+		return
+	}
+	session, ok := h.sessionFromRequest(r)
+	if ok && !h.validSessionCSRF(r, session) {
+		writeJSONError(w, http.StatusForbidden, "invalid CSRF token", "INVALID_CSRF", requestIDFromContext(r.Context()))
+		return
+	}
+	h.clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// AccountLogoutURL clears the local Chat session and returns a top-level
+// navigation URL for the Account end-session endpoint. No Account ID token is
+// stored in the browser; Account's host-only cookie authorizes global logout.
+// POST /api/logout/account
+func (h *Handler) AccountLogoutURL(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+	if !sameOriginRequest(r) {
+		writeJSONError(w, http.StatusForbidden, "cross-origin logout rejected", "INVALID_ORIGIN", requestID)
+		return
+	}
+	session, ok := h.sessionFromRequest(r)
+	if !ok {
+		h.clearSessionCookie(w)
+		writeJSONError(w, http.StatusUnauthorized, "authentication required", "AUTH_REQUIRED", requestID)
+		return
+	}
+	if session.Kind != "oidc" {
+		writeJSONError(w, http.StatusBadRequest, "Account logout requires an OIDC session", "OIDC_REQUIRED", requestID)
+		return
+	}
+	if !h.validSessionCSRF(r, session) {
+		writeJSONError(w, http.StatusForbidden, "invalid CSRF token", "INVALID_CSRF", requestID)
+		return
+	}
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		log.Printf("account logout state generation failed: %v", err)
+		writeJSONError(w, http.StatusServiceUnavailable, "Account logout is temporarily unavailable", "OIDC_UNAVAILABLE", requestID)
+		return
+	}
+	state := base64.RawURLEncoding.EncodeToString(stateBytes)
+	logoutURL, err := h.accountLogoutURL(state)
+	if err != nil {
+		log.Printf("account logout URL unavailable: %v", err)
+		writeJSONError(w, http.StatusServiceUnavailable, "Account logout is temporarily unavailable", "OIDC_UNAVAILABLE", requestID)
+		return
+	}
+
+	h.setAccountLogoutCookie(w, state, int(accountLogoutStateTTL.Seconds()))
+	h.clearSessionCookie(w)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"redirect_url": logoutURL})
+}
+
+// InviteGenerate handles POST /api/invite/generate.
+func (h *Handler) InviteGenerate(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if h.localCredentialsDisabled(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+
+	authUsername, ok := h.requireSession(w, r)
+	if !ok {
+		return
+	}
+	if !AuthAllow(requestIP(r)) {
+		writeJSONError(w, http.StatusTooManyRequests, "too many attempts, try again later", "RATE_LIMITED", requestID)
+		return
+	}
+	var body struct {
+		Username string `json:"username"`
+		MaxUses  int    `json:"max_uses"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body", "INVALID_JSON", requestID)
+		return
+	}
+
+	maxUses := body.MaxUses
+	if maxUses <= 0 {
+		maxUses = 5
+	}
+
+	code, err := h.store.GenerateInviteCode(authUsername, maxUses)
+	if err != nil {
+		log.Printf("generate invite code error: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "failed to generate invite code", "SERVER_ERROR", requestID)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"code": code,
+	})
+}
+
+// WebhookHandler handles incoming webhook POST requests.
+// POST /api/webhook/{url}
+
+// Extract webhook URL from path: /api/webhook/{url}
+
+// Verify secret from the Authorization header. Do not accept query-string
+// secrets; URLs are commonly logged and copied.
+
+// Parse JSON body
+
+// InviteList handles GET /api/invite/list?username=xxx.
+func (h *Handler) InviteList(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	if h.localCredentialsDisabled(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED", requestID)
+		return
+	}
+	authUsername, ok := h.requireSession(w, r)
+	if !ok {
+		return
+	}
+
+	codes, err := h.store.ListInviteCodes(authUsername)
+	if err != nil {
+		log.Printf("list invite codes error: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, "failed to list invite codes", "SERVER_ERROR", requestID)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"codes": codes,
+	})
+}
