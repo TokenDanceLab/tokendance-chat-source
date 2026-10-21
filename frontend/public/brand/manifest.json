@@ -1,0 +1,9 @@
+{
+  "source_repository": "https://github.com/TokenDanceLab/docs",
+  "source_commit": "9f2a5e352aa9d56cdbc23727b10233bd118d116e",
+  "source_directory": "brand/logo/products/tokendance",
+  "usage": "TokenDance Account login: family silhouette with full Account name; currentColor alpha mask on theme-sensitive controls.",
+  "assets": {
+    "tokendance-mark-white-transparent.svg": "eb2c436c94de44b828e12079237c94f0ea01d051a851c8b97753a77e251be0d6"
+  }
+}
