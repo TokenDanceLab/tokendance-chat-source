@@ -1,0 +1,514 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Geist is the Vercel type system. CJK falls back to the platform UI font. */
+@font-face {
+  font-family: "Geist Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/geist/files/geist-latin-wght-normal.woff2")
+    format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Geist Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/geist/files/geist-latin-ext-wght-normal.woff2")
+    format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7,
+    U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF,
+    U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Geist Mono Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2")
+    format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@custom-variant dark (&:is(.dark *));
+
+/* These variants are the small part of the shadcn stylesheet used by the
+   checked-in primitives. Keep them local so the runtime build does not pull
+   in the shadcn CLI and its filesystem globbing dependency tree. */
+@custom-variant data-open {
+  &:where([data-state="open"], [data-open]:not([data-open="false"])) {
+    @slot;
+  }
+}
+
+@custom-variant data-closed {
+  &:where([data-state="closed"], [data-closed]:not([data-closed="false"])) {
+    @slot;
+  }
+}
+
+@custom-variant data-checked {
+  &:where([data-state="checked"], [data-checked]:not([data-checked="false"])) {
+    @slot;
+  }
+}
+
+@custom-variant data-unchecked {
+  &:where([data-state="unchecked"], [data-unchecked]:not([data-unchecked="false"])) {
+    @slot;
+  }
+}
+
+@custom-variant data-selected {
+  &:where([data-selected="true"], [data-state="selected"]) {
+    @slot;
+  }
+}
+
+@custom-variant data-disabled {
+  &:where([data-disabled="true"], [data-state="disabled"]) {
+    @slot;
+  }
+}
+
+@custom-variant data-active {
+  &:where([data-state="active"], [data-active]:not([data-active="false"])) {
+    @slot;
+  }
+}
+
+@custom-variant data-horizontal {
+  &:where([data-orientation="horizontal"]) {
+    @slot;
+  }
+}
+
+@custom-variant data-vertical {
+  &:where([data-orientation="vertical"]) {
+    @slot;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Monochrome ink system. Color carries state, never decoration.
+   ───────────────────────────────────────────────────────────── */
+
+:root {
+  color-scheme: light;
+
+  --background: oklch(0.985 0 0);
+  --foreground: oklch(0.205 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.205 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.205 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.965 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.965 0 0);
+  --muted-foreground: oklch(0.52 0 0);
+  --accent: oklch(0.945 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.55 0.19 27);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.905 0 0);
+  --input: oklch(0.905 0 0);
+  --ring: oklch(0.63 0 0);
+
+  --chart-1: oklch(0.35 0 0);
+  --chart-2: oklch(0.5 0 0);
+  --chart-3: oklch(0.65 0 0);
+  --chart-4: oklch(0.78 0 0);
+  --chart-5: oklch(0.88 0 0);
+
+  --sidebar: oklch(0.975 0 0);
+  --sidebar-foreground: oklch(0.255 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.94 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.9 0 0);
+  --sidebar-ring: oklch(0.63 0 0);
+
+  --success: oklch(0.55 0.12 155);
+  --warning: oklch(0.68 0.13 75);
+  --danger: oklch(0.55 0.19 27);
+
+  --radius: 0.5rem;
+
+  --chat-identity-hue: 220;
+  --chat-identity-avatar: hsl(220 12% 42%);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --background: oklch(0.155 0 0);
+  --foreground: oklch(0.93 0 0);
+  --card: oklch(0.19 0 0);
+  --card-foreground: oklch(0.93 0 0);
+  --popover: oklch(0.21 0 0);
+  --popover-foreground: oklch(0.93 0 0);
+  --primary: oklch(0.93 0 0);
+  --primary-foreground: oklch(0.155 0 0);
+  --secondary: oklch(0.245 0 0);
+  --secondary-foreground: oklch(0.93 0 0);
+  --muted: oklch(0.245 0 0);
+  --muted-foreground: oklch(0.68 0 0);
+  --accent: oklch(0.27 0 0);
+  --accent-foreground: oklch(0.95 0 0);
+  --destructive: oklch(0.62 0.17 25);
+  --destructive-foreground: oklch(0.97 0 0);
+  --border: oklch(0.275 0 0);
+  --input: oklch(0.31 0 0);
+  --ring: oklch(0.55 0 0);
+
+  --sidebar: oklch(0.17 0 0);
+  --sidebar-foreground: oklch(0.9 0 0);
+  --sidebar-primary: oklch(0.93 0 0);
+  --sidebar-primary-foreground: oklch(0.155 0 0);
+  --sidebar-accent: oklch(0.25 0 0);
+  --sidebar-accent-foreground: oklch(0.95 0 0);
+  --sidebar-border: oklch(0.27 0 0);
+  --sidebar-ring: oklch(0.55 0 0);
+  --chat-identity-avatar: hsl(220 10% 34%);
+
+  --success: oklch(0.68 0.13 155);
+  --warning: oklch(0.75 0.12 78);
+  --danger: oklch(0.62 0.17 25);
+}
+
+@theme inline {
+  --font-sans: "Geist Variable", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans SC", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  --font-heading: var(--font-sans);
+  --font-mono: "Geist Mono Variable", "SFMono-Regular", "Cascadia Code",
+    Consolas, monospace;
+
+  /* Type scale from DESIGN.md */
+  --text-micro: 0.625rem; /* 10px: dense badges and avatar initials */
+  --text-label: 0.6875rem; /* 11px: labels, timestamps, name row */
+  --text-name: 0.8125rem; /* 13px: names and row titles */
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --radius-sm: calc(var(--radius) * 0.75);
+  --radius-md: calc(var(--radius) * 0.9);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: color-mix(in oklch, var(--foreground) 16%, transparent);
+  }
+
+  button,
+  [role="button"] {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  textarea,
+  input {
+    font: inherit;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   App surfaces
+   ───────────────────────────────────────────────────────────── */
+
+.h-screen-mobile {
+  height: 100dvh;
+}
+
+.pb-safe {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+}
+
+.td-composer-group:has([data-slot="input-group-control"]:focus-visible) {
+  border-color: color-mix(in oklch, var(--border), var(--ring) 40%);
+  box-shadow: none;
+}
+
+.chat-generated-avatar {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Scrollbars
+   ───────────────────────────────────────────────────────────── */
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--muted-foreground) 24%, transparent)
+    transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--muted-foreground) 22%, transparent);
+}
+
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Message markdown
+   ───────────────────────────────────────────────────────────── */
+
+.markdown-body {
+  font-size: 0.9375rem;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p {
+  margin: 0.5rem 0;
+}
+
+.markdown-body p:first-child {
+  margin-top: 0;
+}
+
+.markdown-body p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  margin: 1rem 0 0.5rem;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+
+.markdown-body h1 {
+  font-size: 1.2rem;
+}
+.markdown-body h2 {
+  font-size: 1.08rem;
+}
+.markdown-body h3 {
+  font-size: 1rem;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+}
+
+.markdown-body ul {
+  list-style: disc;
+}
+.markdown-body ol {
+  list-style: decimal;
+}
+.markdown-body li {
+  margin: 0.2rem 0;
+}
+
+.markdown-body a {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: color-mix(in oklch, var(--foreground) 35%, transparent);
+}
+
+.markdown-body blockquote {
+  margin: 0.6rem 0;
+  border-left: 2px solid var(--border);
+  padding-left: 0.75rem;
+  color: var(--muted-foreground);
+}
+
+.markdown-body code {
+  border-radius: 4px;
+  background: var(--muted);
+  padding: 0.1rem 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+}
+
+.markdown-body pre {
+  overflow-x: auto;
+}
+
+.markdown-body table {
+  width: 100%;
+  margin: 0.6rem 0;
+  border-collapse: collapse;
+  font-size: 0.86rem;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.55rem;
+  text-align: left;
+}
+
+.markdown-body th {
+  background: var(--muted);
+  font-weight: 600;
+}
+
+.markdown-body img {
+  max-width: 100%;
+  border-radius: var(--radius-lg);
+}
+
+.inline-custom-emoji {
+  width: 1.5em;
+  height: 1.5em;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Menus
+   ───────────────────────────────────────────────────────────── */
+
+.context-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgb(0 0 0 / 0.12);
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 61;
+}
+
+.td-chat-menu {
+  background: var(--popover);
+  color: var(--popover-foreground);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Code blocks / utilities
+   ───────────────────────────────────────────────────────────── */
+
+.td-code-block pre {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  overflow-x: auto;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
