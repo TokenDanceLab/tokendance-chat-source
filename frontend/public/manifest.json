@@ -1,0 +1,22 @@
+{
+  "name": "TokenDance Chat",
+  "short_name": "TokenDance",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "description": "Real-time WebSocket chat with a TokenBot assistant, OIDC sign-in, and PWA support.",
+  "icons": [
+    {
+      "src": "/tokendance-icon-rounded-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/tokendance-icon-rounded-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
