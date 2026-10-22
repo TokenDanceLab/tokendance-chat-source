@@ -1,0 +1,475 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"tokendancechat/backend/store"
+)
+
+// testServer wraps a running HTTP server with its cleanup.
+type testServer struct {
+	server   *http.Server
+	listener net.Listener
+	store    *store.Store
+	addr     string
+}
+
+// startTestServer creates a server, binds a listener, and starts serving.
+func startTestServer(t *testing.T, dbPath, frontendDir string) *testServer {
+	t.Helper()
+
+	// Create a listener first to know the port before starting.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	server, st, _, err := Server(dbPath, frontendDir, listener.Addr().String())
+	if err != nil {
+		listener.Close()
+		t.Fatalf("Server() returned error: %v", err)
+	}
+
+	go server.Serve(listener)
+
+	// Give the server time to start.
+	time.Sleep(100 * time.Millisecond)
+
+	return &testServer{
+		server:   server,
+		listener: listener,
+		store:    st,
+		addr:     listener.Addr().String(),
+	}
+}
+
+func (ts *testServer) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ts.server.Shutdown(ctx)
+	ts.listener.Close()
+	ts.store.Close()
+}
+
+func TestServerStartsAndServesHealth(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "tokendancechat-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	frontendDir := filepath.Join(tmpDir, "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		t.Fatalf("failed to create frontend dir: %v", err)
+	}
+	indexPath := filepath.Join(frontendDir, "index.html")
+	if err := os.WriteFile(indexPath, []byte("<!DOCTYPE html><html><body>TokenDance</body></html>"), 0644); err != nil {
+		t.Fatalf("failed to write index.html: %v", err)
+	}
+
+	ts := startTestServer(t, filepath.Join(tmpDir, "chat.db"), frontendDir)
+	defer ts.Close()
+
+	// Test health check endpoint.
+	resp, err := http.Get("http://" + ts.addr + "/api/health")
+	if err != nil {
+		t.Fatalf("health check request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Test the frontend serves at root.
+	resp2, err := http.Get("http://" + ts.addr + "/")
+	if err != nil {
+		t.Fatalf("frontend request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200 serving frontend, got %d", resp2.StatusCode)
+	}
+}
+
+func TestSPAFallback(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "tokendancechat-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	frontendDir := filepath.Join(tmpDir, "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		t.Fatalf("failed to create frontend dir: %v", err)
+	}
+	indexContent := "<!DOCTYPE html><html><head><title>TokenDance SPA</title></head><body>SPA App</body></html>"
+	if err := os.WriteFile(filepath.Join(frontendDir, "index.html"), []byte(indexContent), 0644); err != nil {
+		t.Fatalf("failed to write index.html: %v", err)
+	}
+
+	ts := startTestServer(t, filepath.Join(tmpDir, "chat.db"), frontendDir)
+	defer ts.Close()
+
+	// Request a non-existent SPA route -- should fall back to index.html.
+	resp, err := http.Get("http://" + ts.addr + "/some-spa-route")
+	if err != nil {
+		t.Fatalf("SPA fallback request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200 for SPA fallback, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("SPA shell must not be cached, got Cache-Control %q", got)
+	}
+
+	buf := make([]byte, 2048)
+	n, _ := resp.Body.Read(buf)
+	body := string(buf[:n])
+	if body != indexContent {
+		t.Errorf("SPA fallback did not return index.html content. Got: %s", body)
+	}
+
+	// Root path should also serve index.html.
+	resp2, err := http.Get("http://" + ts.addr + "/")
+	if err != nil {
+		t.Fatalf("root path request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200 for root path, got %d", resp2.StatusCode)
+	}
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "tokendancechat-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	frontendDir := filepath.Join(tmpDir, "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		t.Fatalf("failed to create frontend dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(frontendDir, "index.html"), []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write index.html: %v", err)
+	}
+
+	ts := startTestServer(t, filepath.Join(tmpDir, "chat.db"), frontendDir)
+	defer ts.Close()
+
+	// Verify the server is responding before shutdown.
+	resp, err := http.Get("http://" + ts.addr + "/api/health")
+	if err != nil {
+		t.Fatalf("pre-shutdown health check failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// Perform graceful shutdown via the server's Shutdown method.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := ts.server.Shutdown(ctx); err != nil {
+		t.Fatalf("graceful shutdown failed: %v", err)
+	}
+
+	// After shutdown, the server should no longer accept connections.
+	time.Sleep(50 * time.Millisecond)
+	_, err = http.Get("http://" + ts.addr + "/api/health")
+	if err == nil {
+		t.Error("expected connection refused after shutdown, but request succeeded")
+	}
+}
+
+// TestParseEnvBool verifies all variants of the boolean environment parser.
+func TestParseEnvBool(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		// True values.
+		{"1", true},
+		{"true", true},
+		{"True", true},
+		{"TRUE", true},
+		{"yes", true},
+		{"YES", true},
+		{"y", true},
+		{"Y", true},
+		{"on", true},
+		{"ON", true},
+		// False values.
+		{"0", false},
+		{"false", false},
+		{"False", false},
+		{"no", false},
+		{"NO", false},
+		{"off", false},
+		{"OFF", false},
+		// Edge cases.
+		{"", false},
+		{"garbage", false},
+		{"  true  ", true},
+		{"  1  ", true},
+		{"  0  ", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := parseEnvBool(tt.input)
+			if got != tt.want {
+				t.Errorf("parseEnvBool(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestServerEnvBotName verifies CHAT_BOT_NAME reaches the public config.
+func TestServerEnvBotName(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "tokendancechat-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	frontendDir := filepath.Join(tmpDir, "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		t.Fatalf("failed to create frontend dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(frontendDir, "index.html"), []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write index.html: %v", err)
+	}
+
+	t.Setenv("CHAT_BOT_NAME", "CustomBot")
+
+	ts := startTestServer(t, filepath.Join(tmpDir, "chat.db"), frontendDir)
+	defer ts.Close()
+
+	body, err := http.Get("http://" + ts.addr + "/api/config")
+	if err != nil {
+		t.Fatalf("config request failed: %v", err)
+	}
+	defer body.Body.Close()
+	var cfg map[string]any
+	if err := json.NewDecoder(body.Body).Decode(&cfg); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if cfg["bot_name"] != "CustomBot" {
+		t.Errorf("bot_name = %v, want CustomBot", cfg["bot_name"])
+	}
+}
+
+// TestServerDefaultBotName verifies Server uses the default bot name when the
+// environment variable is not set.
+func TestServerDefaultBotName(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "tokendancechat-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	frontendDir := filepath.Join(tmpDir, "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		t.Fatalf("failed to create frontend dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(frontendDir, "index.html"), []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write index.html: %v", err)
+	}
+
+	ts := startTestServer(t, filepath.Join(tmpDir, "chat.db"), frontendDir)
+	defer ts.Close()
+
+	body, err := http.Get("http://" + ts.addr + "/api/config")
+	if err != nil {
+		t.Fatalf("config request failed: %v", err)
+	}
+	defer body.Body.Close()
+	var cfg map[string]any
+	if err := json.NewDecoder(body.Body).Decode(&cfg); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if cfg["bot_name"] != "TokenBot" {
+		t.Errorf("bot_name = %v, want TokenBot", cfg["bot_name"])
+	}
+}
+
+// TestRetiredRoutesReturn404 is the route contract test for the PR-1
+// retirement: deleted routes (/api/upload, /api/giphy/*, /uploads/) must
+// return 404 for every HTTP method — not fall through to the SPA fallback
+// which would return index.html and make route removal look green — while
+// the retained emoji routes must still be registered.
+func TestRetiredRoutesReturn404(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "tokendancechat-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	frontendDir := filepath.Join(tmpDir, "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		t.Fatalf("failed to create frontend dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(frontendDir, "index.html"), []byte("<!DOCTYPE html><html><body>SPA</body></html>"), 0644); err != nil {
+		t.Fatalf("failed to write index.html: %v", err)
+	}
+
+	ts := startTestServer(t, filepath.Join(tmpDir, "chat.db"), frontendDir)
+	defer ts.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Every HTTP method on every deleted route must 404. The /uploads/foo/bar.png
+	// case covers the old nested-file serving shape, /api and /uploads bare
+	// paths cover the guard edge cases (filepath.Clean strips trailing slashes).
+	retiredPaths := []string{
+		"/api/upload",
+		"/api/giphy/search",
+		"/api/giphy/trending",
+		"/uploads/sample.png",
+		"/uploads/",
+		"/uploads/foo/bar.png",
+		"/api",
+		"/uploads",
+	}
+	methods := []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete}
+	for _, p := range retiredPaths {
+		for _, m := range methods {
+			t.Run(m+" "+p, func(t *testing.T) {
+				req, err := http.NewRequest(m, "http://"+ts.addr+p, nil)
+				if err != nil {
+					t.Fatalf("failed to create request: %v", err)
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatalf("request failed: %v", err)
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusNotFound {
+					t.Errorf("expected 404 for %s %s, got %d", m, p, resp.StatusCode)
+				}
+			})
+		}
+	}
+
+	// Query parameters must not resurrect a deleted route.
+	t.Run("GET /api/giphy/search with query params is 404", func(t *testing.T) {
+		resp, err := client.Get("http://" + ts.addr + "/api/giphy/search?q=test&limit=5&offset=2&type=sticker")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected 404 for /api/giphy/search with query params, got %d", resp.StatusCode)
+		}
+	})
+
+	// Retained emoji routes must still be registered: wrong method on a
+	// registered route yields 405, not the 404 of a deleted route.
+	t.Run("GET /api/emoji/upload is 405 not 404", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "http://"+ts.addr+"/api/emoji/upload", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("expected 405 for GET /api/emoji/upload (route registered, wrong method), got %d", resp.StatusCode)
+		}
+	})
+
+	// /uploads/emojis/ is still registered: a missing file is a handler 404.
+	t.Run("GET /uploads/emojis/x.png is 404 from handler", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "http://"+ts.addr+"/uploads/emojis/x.png", nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected 404 for GET /uploads/emojis/x.png (route registered, file missing), got %d", resp.StatusCode)
+		}
+	})
+}
+
+// TestEmojiServeThroughServer verifies the retained emoji chain still works
+// end-to-end through the full server stack, and that the retired /uploads/
+// route cannot read emoji files.
+func TestEmojiServeThroughServer(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "tokendancechat-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	frontendDir := filepath.Join(tmpDir, "frontend")
+	if err := os.MkdirAll(frontendDir, 0755); err != nil {
+		t.Fatalf("failed to create frontend dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(frontendDir, "index.html"), []byte("ok"), 0644); err != nil {
+		t.Fatalf("failed to write index.html: %v", err)
+	}
+
+	ts := startTestServer(t, filepath.Join(tmpDir, "chat.db"), frontendDir)
+	defer ts.Close()
+
+	// Seed an emoji file into the server's emojis dir (dataDir = tmpDir).
+	emojiDir := filepath.Join(tmpDir, "uploads", "emojis")
+	if err := os.MkdirAll(emojiDir, 0755); err != nil {
+		t.Fatalf("failed to create emojis dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(emojiDir, "spark.png"), []byte("emoji-png-bytes"), 0644); err != nil {
+		t.Fatalf("failed to write emoji file: %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	t.Run("GET /uploads/emojis/spark.png serves the file", func(t *testing.T) {
+		resp, err := client.Get("http://" + ts.addr + "/uploads/emojis/spark.png")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 serving emoji, got %d", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "image/png" {
+			t.Errorf("expected image/png content type, got %q", ct)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("failed to read response body: %v", err)
+		}
+		if string(body) != "emoji-png-bytes" {
+			t.Errorf("expected emoji bytes, got %q", string(body))
+		}
+	})
+
+	t.Run("retired /uploads/ route cannot read emoji files", func(t *testing.T) {
+		resp, err := client.Get("http://" + ts.addr + "/uploads/spark.png")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected 404 for /uploads/spark.png (retired route), got %d", resp.StatusCode)
+		}
+	})
+}
