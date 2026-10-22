@@ -1,0 +1,24 @@
+FROM alpine:3.21
+ARG SOURCE_REVISION=master
+ARG SOURCE_URL
+RUN test -n "$SOURCE_URL"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="${SOURCE_URL}" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}"
+RUN apk add --no-cache ca-certificates tzdata
+# The bind-mounted data directory on the deployment host is owned by UID 100
+# (created by the first runtime image, which auto-assigned 100). The runtime
+# user must match that owner or SQLite cannot open chat.db (mode 0600).
+RUN addgroup -g 100 appgroup && adduser -u 100 -G appgroup -D appuser
+WORKDIR /app
+COPY tokendancechat /app/tokendancechat
+COPY frontend/dist/ /app/frontend/dist/
+COPY LICENSE NOTICE /app/
+COPY LICENSES/ /app/LICENSES/
+RUN mkdir -p /app/data && chown appuser:appgroup /app/data && chmod +x /app/tokendancechat
+ENV CHAT_DB_PATH=/app/data/chat.db
+ENV CHAT_FRONTEND_DIR=/app/frontend/dist
+USER appuser
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 CMD sh -ec 'port="${CHAT_ADDR:-:8080}"; port="${port##*:}"; wget -qO- "http://127.0.0.1:${port}/api/health" >/dev/null'
+CMD ["/app/tokendancechat"]
