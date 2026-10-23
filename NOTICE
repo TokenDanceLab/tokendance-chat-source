@@ -1,0 +1,33 @@
+TokenDanceChat
+Copyright (c) 2026 TokenDanceChat Contributors
+SPDX-License-Identifier: AGPL-3.0-only
+
+This release, as a whole, is offered under GNU AGPL version 3 only.
+The complete license is in LICENSE. There is no warranty except as
+expressly required by applicable law or separately agreed in writing.
+
+The project was previously published under MIT through commit
+3d5a1ce958fcffdeecbac64d032887c7548cefcd. Those grants are not revoked.
+LICENSES/MIT-legacy.txt preserves the original notice and terms for that
+code, including when it is reused in this release.
+
+Third-party components and copied upstream code retain their original
+copyright notices and licenses. This project license does not relicense
+those works or claim exclusive ownership of them. In particular, the
+shadcn/ui, assistant-ui and AI Elements component sources, Geist fonts,
+Lucide/LobeHub icons, npm packages and Go modules remain subject to their
+respective upstream terms. Consult the component notices and the license
+files in the resolved dependencies; this notice is not a substitute for
+them. Preserve those notices when redistributing them.
+
+Copied component upstream notices are included as LICENSES/shadcn-ui.txt,
+LICENSES/assistant-ui.txt and LICENSES/ai-elements.txt. AI Elements uses
+Apache-2.0; the full terms are included in LICENSES/Apache-2.0.txt.
+
+Source: https://github.com/TokenDanceLab/tokendance-chat-source
+For a deployed build, use the Source and license menu entry and the OCI
+image source/revision labels to locate the matching public source snapshot.
+
+The software license grants no permission to attack a deployed service.
+Private vulnerability reporting:
+https://github.com/TokenDanceLab/tokendance-chat-source/security/advisories/new
