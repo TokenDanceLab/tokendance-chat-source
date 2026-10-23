@@ -1,0 +1,72 @@
+# Dependencies
+node_modules/
+
+# Build output
+frontend/dist/
+backend/dist/
+frontend/tsconfig.tsbuildinfo
+backend/tokendancechat.exe
+backend/tokendancechat
+
+# Database
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment
+.env
+.env.local
+.env.*
+!.env.example
+!.env.local.example
+*.local
+
+# Local handoff / private operations notes
+HANDOFF.md
+HANDOFF*.md
+*.handoff.md
+server-secrets/  # leak-guard-allow:LG-3BD2D502
+
+# Local git worktrees
+.worktrees/
+.trash/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+.claude/
+dist/
+
+backend/backend.exe
+
+build/
+
+frontend/test-results/
+frontend/playwright-report/
+frontend/coverage/
+frontend/artifacts/
+__pycache__/
+*.pyc
+
+# temp
+.tmp/
+/tokendancechat
+
+.agents/
+
+deploy.md
+
+# 项目私有层：草图、roadmap 草稿、本地清单（凭据走 secrets，不放这里）
+.local/
+/migrate-sqlite-pg
